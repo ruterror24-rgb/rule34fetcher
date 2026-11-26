@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::util::{self, Kind, RemotePost};
 
@@ -8,6 +10,60 @@ use crate::util::{self, Kind, RemotePost};
 pub struct TagSuggestion {
     pub tag: String,
     pub count: Option<u64>,
+    pub category: Option<TagCategory>,
+}
+
+static TAG_CATEGORY_CACHE: OnceLock<Mutex<HashMap<String, Option<TagCategory>>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagCategory {
+    Copyright,
+    Character,
+    Artist,
+    General,
+    Meta,
+}
+
+impl TagCategory {
+    pub const ALL: [Self; 5] = [
+        Self::Copyright,
+        Self::Character,
+        Self::Artist,
+        Self::General,
+        Self::Meta,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Copyright => "Copyright",
+            Self::Character => "Character",
+            Self::Artist => "Artist",
+            Self::General => "General",
+            Self::Meta => "Meta",
+        }
+    }
+
+    fn from_api_type(value: &Value) -> Option<Self> {
+        match value.as_u64().or_else(|| value.as_str()?.parse().ok())? {
+            0 => Some(Self::General),
+            1 => Some(Self::Artist),
+            3 => Some(Self::Copyright),
+            4 => Some(Self::Character),
+            5 => Some(Self::Meta),
+            _ => None,
+        }
+    }
+
+    fn from_xml_type(value: &str) -> Option<Self> {
+        match value.parse::<u8>().ok()? {
+            0 => Some(Self::General),
+            1 => Some(Self::Artist),
+            3 => Some(Self::Copyright),
+            4 => Some(Self::Character),
+            5 => Some(Self::Meta),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +144,7 @@ pub async fn tag_suggestions(
     client: &reqwest::Client,
     query: &str,
     credentials: Option<(&str, &str)>,
+    enrich_prefix_categories: bool,
 ) -> Result<Vec<TagSuggestion>> {
     let url = reqwest::Url::parse_with_params(
         "https://api.rule34.xxx/autocomplete.php",
@@ -115,13 +172,48 @@ pub async fn tag_suggestions(
     // matches embedded anywhere in the tag (e.g. terraria -> nurse_(terraria)).
     let literal_query = query.trim().replace('%', "").replace('_', r"\_");
     if !literal_query.is_empty() {
+        if let Some((user_id, api_key)) = credentials {
+            // Exact lookup enriches autocomplete entries with their category
+            // and authoritative count. This is important for common tags
+            // whose substring search would otherwise be buried past the popup's
+            // initially visible rows.
+            let exact_url = reqwest::Url::parse_with_params(
+                "https://api.rule34.xxx/index.php",
+                &[
+                    ("page", "dapi"),
+                    ("s", "tag"),
+                    ("q", "index"),
+                    ("json", "1"),
+                    ("limit", "1"),
+                    ("name", query.trim()),
+                    ("user_id", user_id),
+                    ("api_key", api_key),
+                ],
+            )?;
+            if let Ok(response) = client
+                .get(exact_url)
+                .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+                .send()
+                .await
+            {
+                if response.status().is_success() {
+                    if let Ok(body) = response.text().await {
+                        if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+                            collect_suggestions(&value, &mut suggestions);
+                        } else {
+                            collect_xml_tag_suggestions(&body, &mut suggestions);
+                        }
+                    }
+                }
+            }
+        }
         let pattern = format!("%{literal_query}%");
         let mut params = vec![
             ("page", "dapi"),
             ("s", "tag"),
             ("q", "index"),
             ("json", "1"),
-            ("limit", "100"),
+            ("limit", "1000"),
             ("orderby", "count"),
             ("order", "DESC"),
             ("name_pattern", pattern.as_str()),
@@ -149,24 +241,139 @@ pub async fn tag_suggestions(
             }
         }
     }
-    let mut seen = std::collections::HashSet::new();
-    suggestions.retain(|suggestion| {
-        !suggestion.tag.trim().is_empty()
-            && normalize_tag(&suggestion.tag).contains(&normalize_tag(query))
-            && seen.insert(normalize_tag(&suggestion.tag))
-    });
+    if enrich_prefix_categories {
+        if let Some((user_id, api_key)) = credentials {
+            let normalized_query = normalize_tag(query);
+            let candidates = suggestions
+                .iter()
+                .filter(|suggestion| {
+                    suggestion.category.is_none()
+                        && normalize_tag(&suggestion.tag).starts_with(&normalized_query)
+                })
+                .take(10)
+                .map(|suggestion| suggestion.tag.clone())
+                .collect::<Vec<_>>();
+
+            let cache = TAG_CATEGORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut pending = tokio::task::JoinSet::new();
+            for tag in candidates {
+                let cached = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&normalize_tag(&tag))
+                    .copied();
+                if let Some(category) = cached {
+                    set_suggestion_category(&mut suggestions, &tag, category);
+                    continue;
+                }
+                let client = client.clone();
+                let user_id = user_id.to_owned();
+                let api_key = api_key.to_owned();
+                pending.spawn(async move {
+                    let category = exact_tag_category(&client, &tag, &user_id, &api_key).await;
+                    (tag, category)
+                });
+            }
+            while let Some(result) = pending.join_next().await {
+                if let Ok((tag, category)) = result {
+                    cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(normalize_tag(&tag), category);
+                    set_suggestion_category(&mut suggestions, &tag, category);
+                }
+            }
+        }
+    }
+    let mut merged = std::collections::HashMap::<String, TagSuggestion>::new();
+    for suggestion in suggestions {
+        let key = normalize_tag(&suggestion.tag);
+        if key.is_empty() || !key.contains(&normalize_tag(query)) {
+            continue;
+        }
+        merged
+            .entry(key)
+            .and_modify(|existing| {
+                existing.category = existing.category.or(suggestion.category);
+                existing.count = match (existing.count, suggestion.count) {
+                    (Some(0), Some(count)) => Some(count),
+                    (None, count) => count,
+                    (count, _) => count,
+                };
+            })
+            .or_insert(suggestion);
+    }
+    let mut suggestions = merged
+        .into_values()
+        .filter(|suggestion| suggestion.count != Some(0))
+        .collect::<Vec<_>>();
     // The GUI displays only a few rows. Put embedded matches first so the
-    // prefix-only autocomplete results cannot push them out of the popup.
+    // prefix-only autocomplete results cannot push them out of the popup,
+    // while keeping an exact match (such as "video") at the very top.
     let normalized_query = normalize_tag(query);
     suggestions.sort_by(|left, right| {
-        let left_prefix = normalize_tag(&left.tag).starts_with(&normalized_query);
-        let right_prefix = normalize_tag(&right.tag).starts_with(&normalized_query);
-        left_prefix
-            .cmp(&right_prefix)
+        let left_normalized = normalize_tag(&left.tag);
+        let right_normalized = normalize_tag(&right.tag);
+        let left_exact = left_normalized == normalized_query;
+        let right_exact = right_normalized == normalized_query;
+        let left_prefix = left_normalized.starts_with(&normalized_query);
+        let right_prefix = right_normalized.starts_with(&normalized_query);
+        right_exact
+            .cmp(&left_exact)
+            .then_with(|| left_prefix.cmp(&right_prefix))
             .then_with(|| right.count.cmp(&left.count))
             .then_with(|| left.tag.cmp(&right.tag))
     });
     Ok(suggestions)
+}
+
+fn set_suggestion_category(
+    suggestions: &mut [TagSuggestion],
+    tag: &str,
+    category: Option<TagCategory>,
+) {
+    if let Some(suggestion) = suggestions
+        .iter_mut()
+        .find(|suggestion| normalize_tag(&suggestion.tag) == normalize_tag(tag))
+    {
+        suggestion.category = category;
+    }
+}
+
+async fn exact_tag_category(
+    client: &reqwest::Client,
+    tag: &str,
+    user_id: &str,
+    api_key: &str,
+) -> Option<TagCategory> {
+    let url = reqwest::Url::parse_with_params(
+        "https://api.rule34.xxx/index.php",
+        &[
+            ("page", "dapi"),
+            ("s", "tag"),
+            ("q", "index"),
+            ("name", tag),
+            ("limit", "1"),
+            ("user_id", user_id),
+            ("api_key", api_key),
+        ],
+    )
+    .ok()?;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let mut suggestions = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+        collect_suggestions(&value, &mut suggestions);
+    } else {
+        collect_xml_tag_suggestions(&body, &mut suggestions);
+    }
+    suggestions
+        .into_iter()
+        .find(|suggestion| normalize_tag(&suggestion.tag) == normalize_tag(tag))
+        .and_then(|suggestion| suggestion.category)
 }
 
 fn collect_xml_tag_suggestions(body: &str, output: &mut Vec<TagSuggestion>) {
@@ -181,6 +388,10 @@ fn collect_xml_tag_suggestions(body: &str, output: &mut Vec<TagSuggestion>) {
         output.push(TagSuggestion {
             tag: tag.trim().to_owned(),
             count: element.value().attr("count").and_then(|count| count.parse().ok()),
+            category: element
+                .value()
+                .attr("type")
+                .and_then(TagCategory::from_xml_type),
         });
     }
 }
@@ -287,6 +498,9 @@ fn collect_suggestions(value: &Value, output: &mut Vec<TagSuggestion>) {
                 output.push(TagSuggestion {
                     tag: tag.to_owned(),
                     count,
+                    category: ["type", "category", "tag_type"]
+                        .iter()
+                        .find_map(|key| map.get(*key).and_then(TagCategory::from_api_type)),
                 });
             } else {
                 for item in map.values() {
@@ -297,6 +511,7 @@ fn collect_suggestions(value: &Value, output: &mut Vec<TagSuggestion>) {
         Value::String(text) => output.push(TagSuggestion {
             tag: strip_count_from_label(text).unwrap_or(text.trim()).to_owned(),
             count: count_from_label(text),
+            category: None,
         }),
         _ => {}
     }

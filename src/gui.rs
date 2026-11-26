@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -84,6 +84,8 @@ struct FetcherApp {
     cancellation: Option<Arc<AtomicBool>>,
     include_suggestions: SuggestionState,
     exclude_suggestions: SuggestionState,
+    enabled_tag_categories: [bool; 5],
+    suggestion_generations: [Arc<AtomicU64>; 2],
     messages: Vec<String>,
     rx: Receiver<Message>,
     tx: Sender<Message>,
@@ -119,6 +121,11 @@ impl Default for FetcherApp {
             cancellation: None,
             include_suggestions: SuggestionState::default(),
             exclude_suggestions: SuggestionState::default(),
+            enabled_tag_categories: [true; 5],
+            suggestion_generations: [
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ],
             messages: vec![
                 "Укажите теги и проверьте их. Данные API читаются из r34.env.".into(),
             ],
@@ -306,6 +313,14 @@ impl FetcherApp {
     }
 
     fn request_suggestions(&mut self, field: SuggestionField, input: &str) {
+        let generation_index = match field {
+            SuggestionField::Include => 0,
+            SuggestionField::Exclude => 1,
+        };
+        let generation = self.suggestion_generations[generation_index]
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let generation_state = Arc::clone(&self.suggestion_generations[generation_index]);
         let query = last_tag(input).trim_start_matches('-').to_owned();
         let state = self.suggestions_mut(field);
         state.query = query.clone();
@@ -317,7 +332,10 @@ impl FetcherApp {
         state.loading = true;
         let tx = self.tx.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(180));
+            thread::sleep(Duration::from_millis(300));
+            if generation_state.load(Ordering::Relaxed) != generation {
+                return;
+            }
             let result = fetch_suggestions(&query).map_err(|error| error.to_string());
             let _ = tx.send(Message::Suggestions(field, query, result));
         });
@@ -330,11 +348,40 @@ impl FetcherApp {
         anchor: egui::Rect,
         focused: bool,
     ) {
-        let suggestions = self.suggestions_mut(field).values.clone();
+        let enabled_categories = self.enabled_tag_categories;
+        let show_unknown = enabled_categories.iter().all(|enabled| *enabled);
+        let (query, values) = {
+            let state = self.suggestions_mut(field);
+            (state.query.clone(), state.values.clone())
+        };
+        let suggestions = values
+            .iter()
+            .filter(|suggestion| match suggestion.category {
+                Some(category) => crate::api::TagCategory::ALL
+                    .iter()
+                    .position(|candidate| *candidate == category)
+                    .is_some_and(|index| enabled_categories[index]),
+                None => show_unknown,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if suggestions.is_empty() {
             return;
         }
-        let popup_size = egui::vec2(anchor.width(), (suggestions.len().min(7) as f32) * 26.0 + 12.0);
+        let normalized_query = query.trim().to_ascii_lowercase().replace(' ', "_");
+        let (mut normal_suggestions, mut reverse_suggestions): (Vec<_>, Vec<_>) = suggestions
+            .into_iter()
+            .partition(|suggestion| {
+                suggestion
+                    .tag
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace(' ', "_")
+                    .starts_with(&normalized_query)
+            });
+        normal_suggestions.truncate(100);
+        reverse_suggestions.truncate(100);
+        let popup_size = egui::vec2(anchor.width(), 238.0);
         let popup_rect = egui::Rect::from_min_size(
             egui::pos2(anchor.left(), anchor.bottom() + 2.0),
             popup_size,
@@ -356,21 +403,37 @@ impl FetcherApp {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(anchor.width());
-                    egui::ScrollArea::vertical()
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            for suggestion in suggestions {
-                                let label = suggestion
-                                    .count
-                                    .map(|count| {
-                                        format!("{} ({})", suggestion.tag, format_count(count))
-                                    })
-                                    .unwrap_or_else(|| suggestion.tag.clone());
-                                if ui.selectable_label(false, label).clicked() {
-                                    selected = Some(suggestion.tag);
-                                }
-                            }
-                        });
+                    ui.columns(2, |columns| {
+                        let groups = [
+                            ("Обычные", normal_suggestions, "normal"),
+                            ("Обратные", reverse_suggestions, "reverse"),
+                        ];
+                        for (column_index, (heading, suggestions, suffix)) in
+                            groups.into_iter().enumerate()
+                        {
+                            columns[column_index].heading(heading);
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("{popup_id}-{suffix}"))
+                                .max_height(200.0)
+                                .show(&mut columns[column_index], |ui| {
+                                    for suggestion in suggestions {
+                                        let label = suggestion
+                                            .count
+                                            .map(|count| {
+                                                format!(
+                                                    "{} ({})",
+                                                    suggestion.tag,
+                                                    format_count(count)
+                                                )
+                                            })
+                                            .unwrap_or_else(|| suggestion.tag.clone());
+                                        if ui.selectable_label(false, label).clicked() {
+                                            selected = Some(suggestion.tag);
+                                        }
+                                    }
+                                });
+                        }
+                    });
                 });
             });
         if let Some(tag) = selected {
@@ -391,7 +454,22 @@ impl eframe::App for FetcherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_messages();
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Rule34 Fetcher");
+            ui.horizontal(|ui| {
+                ui.heading("Rule34 Fetcher");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("tag-category-filter")
+                        .selected_text("Категории тегов")
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show_ui(ui, |ui| {
+                            for (index, category) in crate::api::TagCategory::ALL.iter().enumerate() {
+                                ui.checkbox(
+                                    &mut self.enabled_tag_categories[index],
+                                    category.label(),
+                                );
+                            }
+                        });
+                });
+            });
             ui.label("Поиск и загрузка оригиналов через API сайта");
             ui.add_space(12.0);
 
@@ -509,10 +587,10 @@ impl eframe::App for FetcherApp {
             if !self.checks.is_empty() && !changed {
                 ui.horizontal_wrapped(|ui| {
                     for check in &self.checks {
-                        let (prefix, color) = if check.valid {
-                            ("✓", egui::Color32::from_rgb(50, 150, 75))
+                        let color = if check.valid {
+                            egui::Color32::from_rgb(50, 150, 75)
                         } else {
-                            ("✗", egui::Color32::from_rgb(190, 55, 55))
+                            egui::Color32::from_rgb(190, 55, 55)
                         };
                         let tag_label = if check.excluded {
                             format!("-{}", check.tag)
@@ -523,7 +601,10 @@ impl eframe::App for FetcherApp {
                             .count
                             .map(|count| format!(" ({})", format_count(count)))
                             .unwrap_or_default();
-                        ui.colored_label(color, format!("{prefix} {tag_label}{count}"));
+                        ui.horizontal(|ui| {
+                            paint_tag_status_icon(ui, check.valid, color);
+                            ui.colored_label(color, format!("{tag_label}{count}"));
+                        });
                     }
                 });
                 ui.label("Число в скобках — количество постов с этим тегом.");
@@ -714,7 +795,7 @@ fn fetch_suggestions(query: &str) -> anyhow::Result<Vec<crate::api::TagSuggestio
         .as_ref()
         .filter(|(user_id, api_key)| !user_id.trim().is_empty() && !api_key.trim().is_empty())
         .map(|(user_id, api_key)| (user_id.as_str(), api_key.as_str()));
-    runtime.block_on(crate::api::tag_suggestions(&client, query, credential_refs))
+    runtime.block_on(crate::api::tag_suggestions(&client, query, credential_refs, true))
 }
 
 fn check_tags(
@@ -747,7 +828,7 @@ fn check_tags(
             let credential_refs = credentials
                 .as_ref()
                 .map(|(user_id, api_key)| (user_id.as_str(), api_key.as_str()));
-            let match_tag = crate::api::tag_suggestions(&client, tag, credential_refs)
+            let match_tag = crate::api::tag_suggestions(&client, tag, credential_refs, false)
                 .await?
                 .into_iter()
                 .find(|suggestion| {
@@ -799,6 +880,42 @@ fn format_count(count: u64) -> String {
         formatted.push_str(std::str::from_utf8(chunk).unwrap_or(""));
     }
     formatted
+}
+
+fn paint_tag_status_icon(ui: &mut egui::Ui, valid: bool, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    let stroke = egui::Stroke::new(2.0_f32, color);
+    if valid {
+        ui.painter().line_segment(
+            [
+                rect.left_top() + egui::vec2(2.0, 7.0),
+                rect.left_top() + egui::vec2(5.0, 10.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                rect.left_top() + egui::vec2(5.0, 10.0),
+                rect.left_top() + egui::vec2(12.0, 3.0),
+            ],
+            stroke,
+        );
+    } else {
+        ui.painter().line_segment(
+            [
+                rect.left_top() + egui::vec2(3.0, 3.0),
+                rect.left_top() + egui::vec2(11.0, 11.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                rect.left_top() + egui::vec2(11.0, 3.0),
+                rect.left_top() + egui::vec2(3.0, 11.0),
+            ],
+            stroke,
+        );
+    }
 }
 
 fn is_meta_tag(tag: &str) -> bool {
